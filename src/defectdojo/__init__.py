@@ -1,5 +1,5 @@
 import os
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer as FastMCP
 
 # Import registration functions
 from defectdojo import findings_tools, products_tools, engagements_tools

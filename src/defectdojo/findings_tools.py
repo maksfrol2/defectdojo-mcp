@@ -3,17 +3,37 @@ from defectdojo.client import get_client
 
 # --- Finding Tool Definitions ---
 
-async def get_findings(product_name: Optional[str] = None, status: Optional[str] = None,
-                       severity: Optional[str] = None, limit: int = 20,
-                       offset: int = 0) -> Dict[str, Any]:
+# Default fields returned when the caller doesn't ask for anything specific.
+# Keeps responses lean for the common "what's open / what severity" queries.
+_DEFAULT_FIELDS = ["id", "title", "severity", "status", "active", "risk_accepted", "product_name"]
+
+def _trim_results(result: Dict[str, Any], fields: Optional[List[str]]) -> Dict[str, Any]:
+    """Project each finding down to the requested fields, if any were requested."""
+    if not fields or "results" not in result:
+        return result
+    trimmed = dict(result)
+    trimmed["results"] = [
+        {k: f.get(k) for k in fields if k in f}
+        for f in result["results"]
+    ]
+    return trimmed
+
+
+async def get_findings(product_name: Optional[str] = None, status: Optional[str] = None, vulnerability_id: Optional[str] = None,
+                       severity: Optional[str] = None, limit: int = 10, active: Optional[bool] = None,
+                       offset: int = 0, fields: Optional[List[str]] = None) -> Dict[str, Any]:
     """Get findings with optional filters and pagination.
 
     Args:
         product_name: Optional product name filter
         status: Optional status filter
         severity: Optional severity filter
-        limit: Maximum number of findings to return per page (default: 20)
+        limit: Maximum number of findings to return per page (default: 10)
         offset: Number of records to skip (default: 0)
+        fields: Optional list of fields to return per finding (e.g. ["id", "title", "severity"]).
+                Omit to get default lightweight fields (id, title, severity, status, active,
+                risk_accepted, product_name). Pass "all" as the single element to get the
+                full raw finding object (description, mitigation, steps_to_reproduce, etc.)
 
     Returns:
         Dictionary with status, data/error, and pagination metadata
@@ -25,6 +45,10 @@ async def get_findings(product_name: Optional[str] = None, status: Optional[str]
         filters["status"] = status
     if severity:
         filters["severity"] = severity
+    if active is not None:
+        filters["active"] = active
+    if vulnerability_id is not None:
+        filters["vulnerability_id"] = vulnerability_id
     if limit:
         filters["limit"] = limit
     if offset:
@@ -36,23 +60,13 @@ async def get_findings(product_name: Optional[str] = None, status: Optional[str]
     if "error" in result:
         return {"status": "error", "error": result["error"], "details": result.get("details", "")}
 
-    return {"status": "success", "data": result}
+    effective_fields = None if fields == ["all"] else (fields or _DEFAULT_FIELDS)
+    return {"status": "success", "data": _trim_results(result, effective_fields)}
 
 
-# --- Registration Function ---
-
-def register_tools(mcp):
-    """Register finding-related tools with the MCP server instance."""
-    mcp.tool(name="get_findings", description="Get findings with filtering options and pagination support")(get_findings)
-    mcp.tool(name="search_findings", description="Search for findings using a text query with pagination support")(search_findings)
-    mcp.tool(name="update_finding_status", description="Update the status of a finding (Active, Verified, False Positive, Mitigated, Inactive)")(update_finding_status)
-    mcp.tool(name="add_finding_note", description="Add a note to a finding")(add_finding_note)
-    mcp.tool(name="create_finding", description="Create a new finding")(create_finding)
-
-
-async def search_findings(query: str, product_name: Optional[str] = None,
-                         status: Optional[str] = None, severity: Optional[str] = None,
-                         limit: int = 20, offset: int = 0) -> Dict[str, Any]:
+async def search_findings(query: str, product_name: Optional[str] = None, vulnerability_id: Optional[str] = None,
+                         status: Optional[str] = None, active: Optional[bool] = None, severity: Optional[str] = None,
+                         limit: int = 10, offset: int = 0, fields: Optional[List[str]] = None) -> Dict[str, Any]:
     """Search for findings using a text query with pagination.
 
     Args:
@@ -60,8 +74,10 @@ async def search_findings(query: str, product_name: Optional[str] = None,
         product_name: Optional product name filter
         status: Optional status filter
         severity: Optional severity filter
-        limit: Maximum number of findings to return per page (default: 20)
+        limit: Maximum number of findings to return per page (default: 10)
         offset: Number of records to skip (default: 0)
+        fields: Optional list of fields to return per finding. Omit for default lightweight
+                fields; pass ["all"] for the full raw finding object.
 
     Returns:
         Dictionary with status, data/error, and pagination metadata
@@ -71,6 +87,10 @@ async def search_findings(query: str, product_name: Optional[str] = None,
         filters["product_name"] = product_name
     if status:
         filters["status"] = status
+    if active is not None:
+        filters["active"] = active
+    if vulnerability_id is not None:
+        filters["vulnerability_id"] = vulnerability_id
     if severity:
         filters["severity"] = severity
     if limit:
@@ -84,8 +104,150 @@ async def search_findings(query: str, product_name: Optional[str] = None,
     if "error" in result:
         return {"status": "error", "error": result["error"], "details": result.get("details", "")}
 
+    effective_fields = None if fields == ["all"] else (fields or _DEFAULT_FIELDS)
+    return {"status": "success", "data": _trim_results(result, effective_fields)}
+
+
+
+async def bulk_accept_risk(finding_ids: List[int], reason: str) -> Dict[str, Any]:
+    """Accept risk on multiple findings at once with a shared justification.
+
+    Runs the accept_risk flow (deactivate + risk_accepted + note) for each
+    finding in turn, in a single tool call instead of one per finding.
+
+    Args:
+        finding_ids: List of finding IDs to accept risk on
+        reason: Justification for accepting the risk, applied to all findings
+
+    Returns:
+        status: "success" if all findings succeeded, "partial_success" if some failed
+        results: dict mapping finding_id -> individual result
+        succeeded: list of finding IDs that were fully accepted
+        failed: list of finding IDs that hit an error or partial failure
+    """
+    if not reason.strip():
+        return {"status": "error", "error": "Reason cannot be empty"}
+
+    if not finding_ids:
+        return {"status": "error", "error": "finding_ids cannot be empty"}
+
+    per_finding: Dict[int, Any] = {}
+    succeeded: List[int] = []
+    failed: List[int] = []
+
+    for fid in finding_ids:
+        try:
+            res = await accept_risk(fid, reason)
+        except Exception as e:
+            res = {"status": "error", "error": str(e)}
+
+        per_finding[fid] = res
+        if res.get("status") == "success":
+            succeeded.append(fid)
+        else:
+            failed.append(fid)
+
+    overall_status = "success" if not failed else ("partial_success" if succeeded else "error")
+
+    return {
+        "status": overall_status,
+        "results": per_finding,
+        "succeeded": succeeded,
+        "failed": failed,
+    }
+
+
+# --- Registration Function ---
+
+def register_tools(mcp):
+    """Register finding-related tools with the MCP server instance."""
+    mcp.tool(name="get_findings",description="Get findings with filtering options (product, status, severity, active), pagination, and an optional 'fields' param to trim each finding to just the fields you need (defaults to id/title/severity/status/active/risk_accepted/product_name; pass fields=['all'] for full detail)")(get_findings)
+    mcp.tool(name="search_findings",description="Search for findings using a text query, with filters for product, status, severity, and active state, pagination, and the same optional 'fields' trimming as get_findings")(search_findings)
+    mcp.tool(name="update_finding_status", description="Update the status of a finding (Active, Verified, False Positive, Mitigated, Inactive)")(update_finding_status)
+    mcp.tool(name="add_finding_note", description="Add a note to a finding")(add_finding_note)
+    mcp.tool(name="create_finding", description="Create a new finding")(create_finding)
+    mcp.tool(name="update_risk_acceptance", description="Accept or un-accept the risk on a finding (accepting also deactivates it; requires simple risk acceptance to be enabled for the product)")(update_risk_acceptance)
+    mcp.tool(name="accept_risk",description="Accept a single finding's risk and record the justification in one call (deactivates the finding, sets risk_accepted, adds a note)")(accept_risk)
+    mcp.tool(name="bulk_accept_risk",description="Accept risk on multiple findings at once with a shared justification note — one tool call instead of calling accept_risk per finding")(bulk_accept_risk)
+    
+
+async def update_risk_acceptance(finding_id: int, risk_accepted: bool) -> Dict[str, Any]:
+    """Accept or un-accept the risk on a finding.
+
+    Args:
+        finding_id: ID of the finding to update
+        risk_accepted: True to accept the risk (also deactivates the finding),
+                        False to un-accept it
+
+    Returns:
+        Dictionary with status and data/error
+    """
+    data: Dict[str, Any] = {"risk_accepted": risk_accepted}
+    if risk_accepted:
+        # Required by the API: can't accept risk while the finding is still active
+        data["active"] = False
+
+    client = get_client()
+    result = await client.update_finding(finding_id, data)
+
+    if "error" in result:
+        return {"status": "error", "error": result["error"], "details": result.get("details", "")}
+
     return {"status": "success", "data": result}
 
+
+async def accept_risk(finding_id: int, reason: str) -> Dict[str, Any]:
+    """Accept a finding's risk in one call: deactivates it, marks risk_accepted,
+    and records the justification as a note.
+
+    Args:
+        finding_id: ID of the finding to accept risk on
+        reason: Justification for accepting the risk (required, non-empty)
+
+    Returns:
+        status: "success", "partial_success" (risk accepted but note failed), or "error"
+    """
+    if not reason.strip():
+        return {
+            "status": "error",
+            "error": "Reason cannot be empty"
+        }
+
+    client = get_client()
+
+    # Accept risk
+    result = await client.update_finding(finding_id,
+        {
+            "risk_accepted": True,
+            "active": False
+        }
+    )
+
+    if "error" in result:
+        return {
+            "status": "error",
+            "error": result["error"]
+        }
+
+    # Add note
+    note_result = await client.add_note_to_finding(
+        finding_id,
+        reason
+    )
+
+    if "error" in note_result:
+        return {
+            "status": "partial_success",
+            "finding_updated": True,
+            "note_added": False,
+            "error": note_result["error"]
+        }
+
+    return {
+        "status": "success",
+        "finding_updated": True,
+        "note_added": True
+    }
 
 async def update_finding_status(finding_id: int, status: str) -> Dict[str, Any]:
     """Update the status of a finding.

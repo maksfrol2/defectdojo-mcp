@@ -3,11 +3,11 @@ from defectdojo.client import get_client
 
 # --- Engagement Tool Definitions ---
 
-async def list_engagements(product_id: Optional[int] = None,
+"""async def list_engagements(product_id: Optional[int] = None,
                           status: Optional[str] = None,
                           name: Optional[str] = None,
                           limit: int = 20, offset: int = 0) -> Dict[str, Any]:
-    """List engagements with optional filtering and pagination.
+    List engagements with optional filtering and pagination.
 
     Args:
         product_id: Optional product ID filter
@@ -18,7 +18,7 @@ async def list_engagements(product_id: Optional[int] = None,
 
     Returns:
         Dictionary with status, data/error, and pagination metadata
-    """
+    
     filters = {"limit": limit}
     if product_id:
         filters["product"] = product_id
@@ -39,7 +39,7 @@ async def list_engagements(product_id: Optional[int] = None,
     if "error" in result:
         return {"status": "error", "error": result["error"], "details": result.get("details", "")}
 
-    return {"status": "success", "data": result}
+    return {"status": "success", "data": result}"""
 
 
 async def get_engagement(engagement_id: int) -> Dict[str, Any]:
@@ -59,6 +59,68 @@ async def get_engagement(engagement_id: int) -> Dict[str, Any]:
 
     return {"status": "success", "data": result}
 
+async def list_engagements(product_id: Optional[int] = None,
+                          product_name: Optional[str] = None,
+                          status: Optional[str] = None,
+                          name: Optional[str] = None,
+                          limit: int = 20, offset: int = 0) -> Dict[str, Any]:
+    """List engagements with optional filtering and pagination.
+
+    Args:
+        product_id: Optional product ID filter
+        product_name: Optional product name filter. Resolved to a product_id
+            server-side via a lookup call — use this when you don't know the
+            numeric product ID. Ignored if product_id is also provided.
+        status: Optional status filter (e.g., 'Not Started', 'In Progress', 'Completed')
+        name: Optional engagement name filter (partial match)
+        limit: Maximum number of engagements to return per page (default: 20)
+        offset: Number of records to skip (default: 0)
+
+    Returns:
+        Dictionary with status, data/error, and pagination metadata
+    """
+    client = get_client()
+
+    # Resolve product_name -> product_id without ever surfacing the full
+    # product payload (which can carry a huge embedded findings list) back
+    # to the caller — we only ever pull out `id` and `name`.
+    if product_name and not product_id:
+        lookup = await client.get_products({"name": product_name, "limit": 5})
+
+        if "error" in lookup:
+            return {"status": "error", "error": lookup["error"], "details": lookup.get("details", "")}
+
+        matches = lookup.get("results", [])
+        if not matches:
+            return {"status": "error", "error": f"No product found matching name '{product_name}'"}
+        if len(matches) > 1:
+            names = [m.get("name") for m in matches]
+            return {
+                "status": "error",
+                "error": f"Multiple products match '{product_name}': {', '.join(names)}. "
+                         f"Narrow the name or use product_id instead."
+            }
+        product_id = matches[0]["id"]
+
+    filters = {"limit": limit}
+    if product_id:
+        filters["product"] = product_id
+    if status:
+        valid_statuses = ["Not Started", "Blocked", "Cancelled", "Completed", "In Progress", "On Hold", "Waiting for Resource"]
+        if status not in valid_statuses:
+             return {"status": "error", "error": f"Invalid status filter '{status}'. Must be one of: {', '.join(valid_statuses)}"}
+        filters["status"] = status
+    if name:
+        filters["name"] = name
+    if offset:
+        filters["offset"] = offset
+
+    result = await client.get_engagements(filters)
+
+    if "error" in result:
+        return {"status": "error", "error": result["error"], "details": result.get("details", "")}
+
+    return {"status": "success", "data": result}
 
 async def create_engagement(product_id: int, name: str, target_start: str, target_end: str, status: str, lead_id: int = None, description: str = None, version: str = None, build_id: str = None, commit_hash: str = None, branch_tag: str = None, engagement_type: str = None, deduplication_on_engagement: bool = None, tags: list = None):
     """
@@ -231,3 +293,4 @@ def register_tools(mcp):
     mcp.tool(name="create_engagement", description="Create a new engagement")(create_engagement)
     mcp.tool(name="update_engagement", description="Update an existing engagement")(update_engagement)
     mcp.tool(name="close_engagement", description="Close an engagement")(close_engagement)
+  

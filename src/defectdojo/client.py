@@ -54,10 +54,15 @@ class DefectDojoClient:
         """Update a finding by ID."""
         return await self._request("PATCH", f"/api/v2/findings/{finding_id}/", json=data)
     
+    #async def add_note_to_finding(self, finding_id: int, note: str) -> Dict[str, Any]:
+    #    """Add a note to a finding."""
+    #    data = {"entry": note, "finding": finding_id}
+    #    return await self._request("POST", "/api/v2/notes/", json=data)
+        
     async def add_note_to_finding(self, finding_id: int, note: str) -> Dict[str, Any]:
         """Add a note to a finding."""
-        data = {"entry": note, "finding": finding_id}
-        return await self._request("POST", "/api/v2/notes/", json=data)
+        data = {"entry": note}
+        return await self._request("POST", f"/api/v2/findings/{finding_id}/notes/", json=data)
     
     async def create_finding(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new finding."""
